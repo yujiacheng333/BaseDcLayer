@@ -1,10 +1,12 @@
+
 from tensorflow.examples.tutorials.mnist import input_data
 from tensorflow.python.keras import backend as k
 import tensorflow as tf
-eps = 1e-4
+
+eps = 1e-12
 
 
-def orthogonal_regularizer(scale):
+def orthogonal_regularizer(scale=1e-5):
     """ Defining the Orthogonal regularizer and return the function at
      last to be used in Conv layer as kernel regularizer"""
 
@@ -19,9 +21,8 @@ def orthogonal_regularizer(scale):
         identity = tf.eye(c)
 
         """ Regularizer Wt*W - I """
-        w_transpose = tf.transpose(w)
-        w_mul = tf.matmul(w_transpose, w)
-        reg = tf.subtract(w_mul, identity)
+        w_mul = tf.matmul(w, w, transpose_a=True)
+        reg = w_mul - identity
 
         """Calculating the Loss Obtained"""
         ortho_loss = tf.nn.l2_loss(reg)
@@ -31,16 +32,15 @@ def orthogonal_regularizer(scale):
     return ortho_reg
 
 
-class BaseDcLayer(tf.keras.Model):
+class BaseDcLayer(tf.keras.layers.Layer):
     def __init__(self,
                  filters,
                  kernel_size,
                  strides,
                  padding="same",
                  initializer=tf.keras.initializers.random_normal(0, .02),
-                 bn=True,
-                 regularizer=None,
-                 use_bais=False):
+                 regularizer=orthogonal_regularizer(),
+                 use_bais=True):
         super(BaseDcLayer, self).__init__()
         self.filtes = filters
         self.kernel_size = kernel_size
@@ -54,11 +54,7 @@ class BaseDcLayer(tf.keras.Model):
         self.chs = None
         self.radius = None
         self.moving_avg_norm = None
-        if bn:
-            self.use_bn = True
-            self.bn = tf.keras.layers.BatchNormalization()
-        else:
-            self.use_bn = False
+        self.local_step = -1
 
     def _get_filter_norm(self):
 
@@ -73,10 +69,16 @@ class BaseDcLayer(tf.keras.Model):
         :return: norm for each response area [bs, h - (k-1)+2p//strides, ..., 1]
         """
         ones_filter = tf.ones([self.kernel_size, self.kernel_size, self.chs, 1])
-        input_norm = k.sqrt(tf.nn.conv2d(inputs**2, ones_filter, self.strides, padding=self.padding) + eps)
+        input_norm = k.sqrt(tf.nn.conv2d(inputs ** 2, ones_filter, self.strides, padding=self.padding) + eps)
         return input_norm
 
     def x_norm_batch_norm(self, x, phase_training):
+        """
+        None solution method
+        :param x:
+        :param phase_training:
+        :return:
+        """
         batch_mean = k.mean(x, axis=[0, 1, 2])
         if self.moving_avg_norm is None:
             self.moving_avg_norm = tf.Variable(batch_mean, trainable=False, name="moving_avg")
@@ -92,48 +94,41 @@ class BaseDcLayer(tf.keras.Model):
                                         name="kernel")
         if self.use_bais:
             self.bais = self.add_variable(name='bias',
-                                          shape=[self.filters],
+                                          shape=[self.filtes],
                                           initializer=tf.keras.initializers.Constant(0.))
-        self.radius = self.add_variable(name="radius", shape=[1, 1, 1, self.filtes],
+        self.radius = self.add_variable(name="radius", shape=None,
                                         initializer=tf.keras.initializers.Constant(1))
+
+    @staticmethod
+    def normalize(kernel, norm):
+        return kernel / norm
 
     def call(self, inputs, training=None, mask=None):
         inputs_norm = self._get_input_norm(inputs)
         kernel_norm = self._get_filter_norm()
-        self.kernel = self.kernel / kernel_norm
         inputs = tf.nn.conv2d(inputs,
-                              self.kernel,
+                              self.normalize(self.kernel, kernel_norm),
                               self.strides,
                               self.padding,
                               data_format="NHWC")
         inputs /= inputs_norm
-
+        inputs = 1 - tf.acos(inputs) * 2 / np.pi
+        # inputs = tf.sign(inputs) * inputs ** 2
+        # inputs *= tf.log1p(1 + inputs_norm)
+        # inputs *= (1 - tf.nn.relu(1 - inputs_norm))/inputs_norm
+        inputs *= tf.tanh(kernel_norm / self.radius) * tf.tanh(inputs_norm / self.radius)
         if self.use_bais:
             inputs = tf.nn.bias_add(inputs, self.bais)
-        xnorm_mean = self.x_norm_batch_norm(inputs_norm, training)
-        inputs *= tf.tanh(inputs_norm/xnorm_mean/self.radius)
-        if self.use_bn:
-            inputs = self.bn(inputs, training)
+        # self.kernel = self.kernel / kernel_norm
         return inputs
-
-
-class ConvBN(tf.keras.Model):
-
-    def __init__(self, filters, kernel_size, strides, padding):
-        super(ConvBN, self).__init__()
-        self.conv = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, strides=strides, padding=padding)
-        self.bn = tf.keras.layers.BatchNormalization()
-
-    def call(self, inputs, training=None, mask=None):
-        return self.bn(self.conv(inputs), training)
 
 
 class DC3(tf.keras.Model):
     def __init__(self):
         super(DC3, self).__init__()
-        self.model = tf.keras.Sequential([BaseDcLayer(filters=16, kernel_size=3, strides=2),
-                                          BaseDcLayer(filters=128, kernel_size=3, strides=2, ),
-                                          BaseDcLayer(filters=256, kernel_size=3, strides=2, ),
+        self.model = tf.keras.Sequential([BaseDcLayer(filters=32, kernel_size=3, strides=2),
+                                          BaseDcLayer(filters=64, kernel_size=3, strides=2),
+                                          BaseDcLayer(filters=128, kernel_size=3, strides=2),
                                           tf.keras.layers.Flatten(),
                                           tf.keras.layers.Dense(units=10)])
 
@@ -147,7 +142,8 @@ class Convbnrelu(tf.keras.Model):
         self.model = tf.keras.Sequential([tf.keras.layers.Conv2D(filters=filters,
                                                                  kernel_size=kernel_size,
                                                                  strides=strides,
-                                                                 padding="same"),
+                                                                 padding="same",
+                                                                 use_bias=False),
                                           tf.keras.layers.BatchNormalization(),
                                           tf.keras.layers.ReLU()])
 
@@ -158,9 +154,9 @@ class Convbnrelu(tf.keras.Model):
 class DC32(tf.keras.Model):
     def __init__(self):
         super(DC32, self).__init__()
-        self.model = tf.keras.Sequential([Convbnrelu(filters=16, kernel_size=3, strides=2),
+        self.model = tf.keras.Sequential([Convbnrelu(filters=32, kernel_size=3, strides=2),
+                                          Convbnrelu(filters=64, kernel_size=3, strides=2),
                                           Convbnrelu(filters=128, kernel_size=3, strides=2),
-                                          Convbnrelu(filters=256, kernel_size=3, strides=2),
                                           tf.keras.layers.Flatten(),
                                           tf.keras.layers.Dense(units=10)])
 
@@ -170,30 +166,33 @@ class DC32(tf.keras.Model):
 
 if __name__ == '__main__':
     import numpy as np
+    import matplotlib.pyplot as plt
     tf.enable_eager_execution()
-    optimizer = tf.train.AdamOptimizer(1e-4)
+    optimizer = tf.train.AdamOptimizer(1e-2)
     mnist = input_data.read_data_sets("./data/", one_hot=True)
     train_x = mnist.train.images
     train_y = mnist.train.labels
     test_x = mnist.test.images
     test_y = mnist.test.labels
-    train_x = train_x.reshape([-1, 28, 28, 1]) / 255.
-    test_x = test_x.reshape([-1, 28, 28, 1]) / 255.
-    train_dataset = tf.data.Dataset.from_tensor_slices((train_x, train_y)).shuffle(1000)\
-        .batch(256, drop_remainder=True).repeat(10)
-    test_dataset = tf.data.Dataset.from_tensor_slices((test_x, test_y))
-    model = DC32()
-    for data in train_dataset:
+    train_x = train_x.reshape([-1, 28, 28, 1])
+    test_x = test_x.reshape([-1, 28, 28, 1])
+    train_dataset = tf.data.Dataset.from_tensor_slices((train_x, train_y)).shuffle(10000) \
+        .batch(256, drop_remainder=True).repeat(20)
+    test_dataset = tf.data.Dataset.from_tensor_slices((test_x, test_y)).batch(1024)
+    model = DC3()  # 32 97.8 3 96
+    train_step = 0
+    for train_step, data in enumerate(train_dataset):
         with tf.GradientTape() as tape:
             logits = model(data[0])
             loss = k.mean(tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=data[1]))
             grd = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grd, model.trainable_variables))
-            print(loss)
-    select = np.random.randint(0, 10000, size=100)
-    select_data = test_x[select]
-    select_la = test_y[select]
-    logits = model(select_data, False)
-    logits = np.argmax(logits, axis=-1)
-    select_la = np.argmax(select_la, axis=-1)
-    print(np.mean(logits == select_la))
+            # print(loss)
+        if train_step % 600 == 0:
+            loss = []
+            for select_data, select_la in test_dataset:
+                logits = model(select_data, False)
+                logits = np.argmax(logits, axis=-1)
+                select_la = np.argmax(select_la, axis=-1)
+                loss.append(np.mean(logits == select_la))
+            print(np.mean(loss))
